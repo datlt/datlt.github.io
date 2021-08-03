@@ -1,0 +1,190 @@
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width"/><meta charSet="utf-8"/><link rel="icon" href="/favicon.ico"/><meta name="description" content="Blog cá nhân của m4m (Lê Tuấn Đạt) - m4m &#x27;s personal blog"/><meta property="og:image" content="https://og-image.vercel.app/m4m&#x27;s%20blog.png?theme=light&amp;md=0&amp;fontSize=75px&amp;images=https%3A%2F%2Fassets.vercel.com%2Fimage%2Fupload%2Ffront%2Fassets%2Fdesign%2Fnextjs-black-logo.svg"/><meta name="og:title" content="m4m&#x27;s blog"/><meta name="twitter:card" content="summary_large_image"/><title>Nhận selectionSetList từ Appsync trong lambda</title><meta name="next-head-count" content="8"/><link rel="preload" href="/_next/static/css/d956bfbeac7a7df3d68f.css" as="style"/><link rel="stylesheet" href="/_next/static/css/d956bfbeac7a7df3d68f.css" data-n-g=""/><link rel="preload" href="/_next/static/css/b1646d3833a2f9457355.css" as="style"/><link rel="stylesheet" href="/_next/static/css/b1646d3833a2f9457355.css" data-n-p=""/><noscript data-n-css=""></noscript><link rel="preload" href="/_next/static/chunks/webpack-189c53927ffd3caf09c3.js" as="script"/><link rel="preload" href="/_next/static/chunks/framework-c5113a73163ba9a6512c.js" as="script"/><link rel="preload" href="/_next/static/chunks/main-460b9f826c931ed60fcd.js" as="script"/><link rel="preload" href="/_next/static/chunks/pages/_app-705d7b8cc47a7dd319bb.js" as="script"/><link rel="preload" href="/_next/static/chunks/996-fa0b52be06882e958afa.js" as="script"/><link rel="preload" href="/_next/static/chunks/pages/posts/%5Bid%5D-27f42a375e0fc7d01fb3.js" as="script"/></head><body><div id="__next"><div class="layout_container__3sC0E"><header class="layout_header__3KufH"><a href="/"><img src="/images/profile.jpg" class="utils_borderCircle__16bu1" height="90" width="90" alt="m4m - meob0nmat"/></a><h2 class="utils_headingLg__3uZpz"><a class="utils_colorInherit__rOQns" href="/">m4m - meob0nmat</a></h2></header><main><article><h1 class="utils_headingXl__3wKvI">Nhận selectionSetList từ Appsync trong lambda</h1><div class="utils_lightText__3895Y"><span>2021-05-03</span></div><div><h2>TLDR</h2>
+<p>Team mình sử dụng Amplify Appsync với GraphQL, Resolver là Lambda với DB là Postgres. Gặp vấn đề là Appsync không gửi SelectionSetList mà chỉ gửi Graphql Query param cho Lambda. Dẫn đến lambda không biết phía Graphql muốn lấy field Data nào để trả về cho phù hợp. Bọn mình xử lý bằng cách sửa pipelineFunctions của Amplify để appsync cung cấp SelectionSetList cho lambda</p>
+<h2>Mở đầu</h2>
+<p>Dự án mới nhất của mình dùng Aws Amplify - Appsync chạy Graphql làm back-end. Lần đầu sử dụng công nghệ mới nên cũng không tránh khỏi nhiều bỡ ngỡ.
+Khi làm dự án, team mình gặp một vấn đề khá là thú vị liên quan đến specs của appsync. Trong bài viết này mình sẽ nói qua về vấn đề mà team mình gặp phải và cách bọn mình giải quyết. Hi vọng có thể giúp được ai đó, hoặc chính mình nếu sau này ngồi đọc lại =)))</p>
+<h2>Sơ qua về hệ thống</h2>
+<p>Thông thường nếu dùng Amplify, mọi người hay nghĩ đến việc sử dụng DynamoDB làm Database. Nói thật là nêú dùng Api là GraphQL thì các bạn nên dùng Dynamo nếu có thể được, vì nó cũng có lý do của nó. Appsync hỗ trợ rất nhiều cho Dynamo, hầu hết query thông thường đến Dynamo, Appsync có thể tự xử lý, bạn hầu như không phải viết thêm nhiều code vtl hay lambda. Tiết kiệm được kha khá effort. Tuy nhiên đó là câu chuyện ở một bài viết khác. Dự án này team mình lựa chọn sử dụng Postgres :))</p>
+<p>Có một vài lý do cho quyết định này</p>
+<ol>
+<li>Hệ thống cũ đang sử dụng Postgres. Kèm theo đó là code backend của hệ thống cũ đã có sẵn. Bọn mình không muốn tốn nhiều effort (và rủi ro) khi thiết kế lại toàn bộ hệ thống bằng Dynamo</li>
+<li>Thực tế có những màn hình phải query data với điều kiện phức tạp, khiến việc thiết kế key và index cho Dynamo có thể khó khăn hơn dự kiến</li>
+<li>Team mình cũng không có kinh nghiệm về dynamo lắm. Nếu có issue thì cá nhân mình cảm thấy tự tin hơn nhiều nếu hệ thống sử dụng postgres so vơí Dynamo. Đây là vấn đề về cá nhân thôi</li>
+</ol>
+<p>Do Appsync không thể tự resolve data source là Postgres(Chạy trên RDS) nên cần phải cung cấp function lambda làm resolve cho Appsync.
+Một request từ client đến DB sẽ có sơ đồ đại khái như thế này:</p>
+<p>Client-----> AppSync ------> Lambda ------> Postgres</p>
+<p>Client gửi một GraphQl query đến Appsync, Appsync sẽ parse query và chuyển nó thành một request đến Lambda.</p>
+<h2>Vấn đề</h2>
+<p>VD với GraphQL schema như sau</p>
+<pre><code class="language-GraphQL">type Organization {
+    organization_id: String!
+    name: String!
+    description: String
+    locations: [Location]
+}
+
+type Location {
+    loc_id: String!
+    loc_name: String!
+    description: String!
+    phone_num: String!
+    loc_status: Boolean!
+    addr: String!
+    organization: Organization
+}
+
+</code></pre>
+<p>Schema này khai báo 2 model, Organization và Location. Trong đó một Organization có thể có nhiều Location. Một location chỉ thuộc vào 1 Organization.</p>
+<p>Với Schema như thế này, chúng ta có thể viết query như sau để truy vấn Organization và Location tương ứng</p>
+<pre><code class="language-GraphQL">query MyQuery {
+  organizationList {
+    name
+    organization_id
+    description
+    locations {
+      loc_id
+      loc_name
+      description
+      phone_num
+      loc_status
+      addr
+    }
+  }
+}
+</code></pre>
+<p>Với query này, mặc định lambda function sẽ nhận được request với parameters như sau</p>
+<pre><code class="language-json">{
+    "typeName": "Query",
+    "fieldName": "organizationList",
+    "arguments": {},
+    "identity": {
+        // Cognito user info
+    },
+    "source": null,
+    "request": {
+        "headers": {
+            // Request headers
+        }
+    },
+    "prev": {
+        "result": {}
+    },
+}
+</code></pre>
+<p>Đến đây chắc hẳn bạn đã nhận ra được vấn đề. Không hiểu vì lý do gì mà theo mặc định của amplify, appsync sẽ không chuyển cho Lambda danh sách field được chỉ định trong query.
+Ví dụ như trong query trên, lambda cần trả về cho appsync các trường <code>name</code> <code>organization_id</code> <code>description</code> của Organization, và <code>loc_id</code> <code>loc_name</code> <code>description</code> <code>phone_num</code> <code>loc_status</code> <code>addr</code> của Location liên quan. Tuy nhiên trong param cuả function lambda, chỉ có arguments của query, dẫn đến lamda không có đủ thông tin để trả về data một cách hiệu quả.</p>
+<p>Mình nói 'một cách hiệu quả' vì trong nhiều trường hợp lambda vẫn có thể generate query dạng <code>Select * from organization join location ...</code> để trả về.</p>
+<p>Tuy nhiên, do GraphQL có thể query được nested object một cách linh hoạt. Nên hoàn toàn có thể nhận query như dưới đây</p>
+<pre><code class="language-GraphQL">query MyQuery {
+  organizationList {
+    name
+    organization_id
+    description
+    locations {
+      loc_id
+      loc_name
+      description
+      phone_num
+      loc_status
+      addr
+      organization {
+        name
+      }
+    }
+  }
+}
+</code></pre>
+<p>hoặc thậm chí như dưới đây</p>
+<pre><code class="language-GraphQL">query MyQuery {
+  organizationList {
+    name
+    organization_id
+    description
+    locations {
+      loc_id
+      loc_name
+      description
+      phone_num
+      loc_status
+      addr
+      organization {
+        name
+        locations {
+          loc_name
+        }
+      }
+    }
+  }
+}
+</code></pre>
+<p>hoặc đơn giản là</p>
+<pre><code class="language-GraphQL">query MyQuery {
+  organizationList {
+    name
+    organization_id
+    description
+  }
+}
+</code></pre>
+<p>Tất cả query trên, lambda đều nhận được request giống hệt nhau. Quá vô lý!!! Nhưng đó là mặc định của Amplify.</p>
+<h2>Cách giải quyết</h2>
+<p>Sau nhiều giờ bơi lội trong đống tài liệu của Amplify, mình đã mò ra được giải pháp.</p>
+<p>Tham số truyền cho lambda có thể được tùy biến thông qua file vtl template. Về các tham số có thể tùy biến, Amplify có viết trong tài liệu sau.</p>
+<p><a href="https://docs.aws.amazon.com/appsync/latest/devguide/resolver-context-reference.html">https://docs.aws.amazon.com/appsync/latest/devguide/resolver-context-reference.html</a></p>
+<p><a href="https://docs.amplify.aws/cli/graphql-transformer/resolvers">https://docs.amplify.aws/cli/graphql-transformer/resolvers</a></p>
+<p>Trong tài liệu chính thức Amplify chỉ nói đến việc custom resolvers cho mỗi graphql query bằng cách tạo thư mục resolvers bên dưới thư mục <code>\amplify\backend\api\[tên API]</code></p>
+<p>Tuy nhiên bạn cũng có thể làm tương tự với thư mục <code>pipelineFunctions</code>
+Trong thư mục <code>pipelineFunctions</code> hãy tạo file vtl với nội dung tương tự như sau</p>
+<pre><code>{
+  "version": "2018-05-29",
+  "operation": "Invoke",
+  "payload": {
+      "typeName": "$ctx.stash.get("typeName")",
+      "fieldName": "$ctx.stash.get("fieldName")",
+      "arguments": $util.toJson($ctx.arguments),
+      "identity": $util.toJson($ctx.identity),
+      "source": $util.toJson($ctx.source),
+      "request": $util.toJson($ctx.request),
+      "prev": $util.toJson($ctx.prev),
+      "selectionSetList": $util.toJson($ctx.info.selectionSetList), ## Đây là thông tin mà lambda cần
+  }
+}
+</code></pre>
+<p>Tên file cần đặt theo đúng conventions của Amplify. Tuy nhiên để đơn giản thì bạn có thể copy lại file vtl đã có sẵn trong thư mục build của amplify và tùy biến lại.</p>
+<p>Khi chạy lệnh <code>amplify push</code>, Amplify sẽ copy file trong thư mục này vào thư mục cùng tên trong thư mục build. Đồng thời khởi tạo lambda function với template được chỉ định.</p>
+<p>Nếu push thành công thì trong lambda function, ngoài các thông tin đã có, bạn sẽ nhận được thêm selectionSetList trong tham số event đầu vào.</p>
+<p>Khi đó, event trong ví dụ ở đầu bài sẽ có dạng như sau:</p>
+<pre><code class="language-json">{
+    "typeName": "Query",
+    "fieldName": "organizationList",
+    "arguments": {},
+    "identity": {
+        // Cognito user info
+    },
+    "source": null,
+    "request": {
+        "headers": {
+            // Request headers
+        }
+    },
+    "prev": {
+        "result": {}
+    },
+    "selectionSetList": [
+        "organizations_list",
+        "organizations_list/name",
+        "organizations_list/organization_id",
+        "organizations_list/description",
+        "organizations_list/locations_list",
+        "organizations_list/locations_list/addr1",
+        "organizations_list/locations_list/description",
+        "organizations_list/locations_list/loc_name",
+        "organizations_list/locations_list/sysid",
+        "organizations_list/locations_list/loc_status"
+    ]
+}
+</code></pre>
+<p><code>selectionSetList</code> ở đây chính là tham số mà lambda cần để sinh query. Đến đây lambda đã có đầy đủ thông tin, việc còn lại chỉ là sinh query để đáp ứng Graphql nữa thôi. :))
+Chúc các bạn thành công!</p>
+</div></article></main><div class="layout_backToHome__3Z5L9"><a href="/">← Back to home</a></div></div></div><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"postData":{"id":"nhan-selectionSetList-tu-appsync-trong-lambda","contentHtml":"\u003ch2\u003eTLDR\u003c/h2\u003e\n\u003cp\u003eTeam mình sử dụng Amplify Appsync với GraphQL, Resolver là Lambda với DB là Postgres. Gặp vấn đề là Appsync không gửi SelectionSetList mà chỉ gửi Graphql Query param cho Lambda. Dẫn đến lambda không biết phía Graphql muốn lấy field Data nào để trả về cho phù hợp. Bọn mình xử lý bằng cách sửa pipelineFunctions của Amplify để appsync cung cấp SelectionSetList cho lambda\u003c/p\u003e\n\u003ch2\u003eMở đầu\u003c/h2\u003e\n\u003cp\u003eDự án mới nhất của mình dùng Aws Amplify - Appsync chạy Graphql làm back-end. Lần đầu sử dụng công nghệ mới nên cũng không tránh khỏi nhiều bỡ ngỡ.\nKhi làm dự án, team mình gặp một vấn đề khá là thú vị liên quan đến specs của appsync. Trong bài viết này mình sẽ nói qua về vấn đề mà team mình gặp phải và cách bọn mình giải quyết. Hi vọng có thể giúp được ai đó, hoặc chính mình nếu sau này ngồi đọc lại =)))\u003c/p\u003e\n\u003ch2\u003eSơ qua về hệ thống\u003c/h2\u003e\n\u003cp\u003eThông thường nếu dùng Amplify, mọi người hay nghĩ đến việc sử dụng DynamoDB làm Database. Nói thật là nêú dùng Api là GraphQL thì các bạn nên dùng Dynamo nếu có thể được, vì nó cũng có lý do của nó. Appsync hỗ trợ rất nhiều cho Dynamo, hầu hết query thông thường đến Dynamo, Appsync có thể tự xử lý, bạn hầu như không phải viết thêm nhiều code vtl hay lambda. Tiết kiệm được kha khá effort. Tuy nhiên đó là câu chuyện ở một bài viết khác. Dự án này team mình lựa chọn sử dụng Postgres :))\u003c/p\u003e\n\u003cp\u003eCó một vài lý do cho quyết định này\u003c/p\u003e\n\u003col\u003e\n\u003cli\u003eHệ thống cũ đang sử dụng Postgres. Kèm theo đó là code backend của hệ thống cũ đã có sẵn. Bọn mình không muốn tốn nhiều effort (và rủi ro) khi thiết kế lại toàn bộ hệ thống bằng Dynamo\u003c/li\u003e\n\u003cli\u003eThực tế có những màn hình phải query data với điều kiện phức tạp, khiến việc thiết kế key và index cho Dynamo có thể khó khăn hơn dự kiến\u003c/li\u003e\n\u003cli\u003eTeam mình cũng không có kinh nghiệm về dynamo lắm. Nếu có issue thì cá nhân mình cảm thấy tự tin hơn nhiều nếu hệ thống sử dụng postgres so vơí Dynamo. Đây là vấn đề về cá nhân thôi\u003c/li\u003e\n\u003c/ol\u003e\n\u003cp\u003eDo Appsync không thể tự resolve data source là Postgres(Chạy trên RDS) nên cần phải cung cấp function lambda làm resolve cho Appsync.\nMột request từ client đến DB sẽ có sơ đồ đại khái như thế này:\u003c/p\u003e\n\u003cp\u003eClient-----\u003e AppSync ------\u003e Lambda ------\u003e Postgres\u003c/p\u003e\n\u003cp\u003eClient gửi một GraphQl query đến Appsync, Appsync sẽ parse query và chuyển nó thành một request đến Lambda.\u003c/p\u003e\n\u003ch2\u003eVấn đề\u003c/h2\u003e\n\u003cp\u003eVD với GraphQL schema như sau\u003c/p\u003e\n\u003cpre\u003e\u003ccode class=\"language-GraphQL\"\u003etype Organization {\n    organization_id: String!\n    name: String!\n    description: String\n    locations: [Location]\n}\n\ntype Location {\n    loc_id: String!\n    loc_name: String!\n    description: String!\n    phone_num: String!\n    loc_status: Boolean!\n    addr: String!\n    organization: Organization\n}\n\n\u003c/code\u003e\u003c/pre\u003e\n\u003cp\u003eSchema này khai báo 2 model, Organization và Location. Trong đó một Organization có thể có nhiều Location. Một location chỉ thuộc vào 1 Organization.\u003c/p\u003e\n\u003cp\u003eVới Schema như thế này, chúng ta có thể viết query như sau để truy vấn Organization và Location tương ứng\u003c/p\u003e\n\u003cpre\u003e\u003ccode class=\"language-GraphQL\"\u003equery MyQuery {\n  organizationList {\n    name\n    organization_id\n    description\n    locations {\n      loc_id\n      loc_name\n      description\n      phone_num\n      loc_status\n      addr\n    }\n  }\n}\n\u003c/code\u003e\u003c/pre\u003e\n\u003cp\u003eVới query này, mặc định lambda function sẽ nhận được request với parameters như sau\u003c/p\u003e\n\u003cpre\u003e\u003ccode class=\"language-json\"\u003e{\n    \"typeName\": \"Query\",\n    \"fieldName\": \"organizationList\",\n    \"arguments\": {},\n    \"identity\": {\n        // Cognito user info\n    },\n    \"source\": null,\n    \"request\": {\n        \"headers\": {\n            // Request headers\n        }\n    },\n    \"prev\": {\n        \"result\": {}\n    },\n}\n\u003c/code\u003e\u003c/pre\u003e\n\u003cp\u003eĐến đây chắc hẳn bạn đã nhận ra được vấn đề. Không hiểu vì lý do gì mà theo mặc định của amplify, appsync sẽ không chuyển cho Lambda danh sách field được chỉ định trong query.\nVí dụ như trong query trên, lambda cần trả về cho appsync các trường \u003ccode\u003ename\u003c/code\u003e \u003ccode\u003eorganization_id\u003c/code\u003e \u003ccode\u003edescription\u003c/code\u003e của Organization, và \u003ccode\u003eloc_id\u003c/code\u003e \u003ccode\u003eloc_name\u003c/code\u003e \u003ccode\u003edescription\u003c/code\u003e \u003ccode\u003ephone_num\u003c/code\u003e \u003ccode\u003eloc_status\u003c/code\u003e \u003ccode\u003eaddr\u003c/code\u003e của Location liên quan. Tuy nhiên trong param cuả function lambda, chỉ có arguments của query, dẫn đến lamda không có đủ thông tin để trả về data một cách hiệu quả.\u003c/p\u003e\n\u003cp\u003eMình nói 'một cách hiệu quả' vì trong nhiều trường hợp lambda vẫn có thể generate query dạng \u003ccode\u003eSelect * from organization join location ...\u003c/code\u003e để trả về.\u003c/p\u003e\n\u003cp\u003eTuy nhiên, do GraphQL có thể query được nested object một cách linh hoạt. Nên hoàn toàn có thể nhận query như dưới đây\u003c/p\u003e\n\u003cpre\u003e\u003ccode class=\"language-GraphQL\"\u003equery MyQuery {\n  organizationList {\n    name\n    organization_id\n    description\n    locations {\n      loc_id\n      loc_name\n      description\n      phone_num\n      loc_status\n      addr\n      organization {\n        name\n      }\n    }\n  }\n}\n\u003c/code\u003e\u003c/pre\u003e\n\u003cp\u003ehoặc thậm chí như dưới đây\u003c/p\u003e\n\u003cpre\u003e\u003ccode class=\"language-GraphQL\"\u003equery MyQuery {\n  organizationList {\n    name\n    organization_id\n    description\n    locations {\n      loc_id\n      loc_name\n      description\n      phone_num\n      loc_status\n      addr\n      organization {\n        name\n        locations {\n          loc_name\n        }\n      }\n    }\n  }\n}\n\u003c/code\u003e\u003c/pre\u003e\n\u003cp\u003ehoặc đơn giản là\u003c/p\u003e\n\u003cpre\u003e\u003ccode class=\"language-GraphQL\"\u003equery MyQuery {\n  organizationList {\n    name\n    organization_id\n    description\n  }\n}\n\u003c/code\u003e\u003c/pre\u003e\n\u003cp\u003eTất cả query trên, lambda đều nhận được request giống hệt nhau. Quá vô lý!!! Nhưng đó là mặc định của Amplify.\u003c/p\u003e\n\u003ch2\u003eCách giải quyết\u003c/h2\u003e\n\u003cp\u003eSau nhiều giờ bơi lội trong đống tài liệu của Amplify, mình đã mò ra được giải pháp.\u003c/p\u003e\n\u003cp\u003eTham số truyền cho lambda có thể được tùy biến thông qua file vtl template. Về các tham số có thể tùy biến, Amplify có viết trong tài liệu sau.\u003c/p\u003e\n\u003cp\u003e\u003ca href=\"https://docs.aws.amazon.com/appsync/latest/devguide/resolver-context-reference.html\"\u003ehttps://docs.aws.amazon.com/appsync/latest/devguide/resolver-context-reference.html\u003c/a\u003e\u003c/p\u003e\n\u003cp\u003e\u003ca href=\"https://docs.amplify.aws/cli/graphql-transformer/resolvers\"\u003ehttps://docs.amplify.aws/cli/graphql-transformer/resolvers\u003c/a\u003e\u003c/p\u003e\n\u003cp\u003eTrong tài liệu chính thức Amplify chỉ nói đến việc custom resolvers cho mỗi graphql query bằng cách tạo thư mục resolvers bên dưới thư mục \u003ccode\u003e\\amplify\\backend\\api\\[tên API]\u003c/code\u003e\u003c/p\u003e\n\u003cp\u003eTuy nhiên bạn cũng có thể làm tương tự với thư mục \u003ccode\u003epipelineFunctions\u003c/code\u003e\nTrong thư mục \u003ccode\u003epipelineFunctions\u003c/code\u003e hãy tạo file vtl với nội dung tương tự như sau\u003c/p\u003e\n\u003cpre\u003e\u003ccode\u003e{\n  \"version\": \"2018-05-29\",\n  \"operation\": \"Invoke\",\n  \"payload\": {\n      \"typeName\": \"$ctx.stash.get(\"typeName\")\",\n      \"fieldName\": \"$ctx.stash.get(\"fieldName\")\",\n      \"arguments\": $util.toJson($ctx.arguments),\n      \"identity\": $util.toJson($ctx.identity),\n      \"source\": $util.toJson($ctx.source),\n      \"request\": $util.toJson($ctx.request),\n      \"prev\": $util.toJson($ctx.prev),\n      \"selectionSetList\": $util.toJson($ctx.info.selectionSetList), ## Đây là thông tin mà lambda cần\n  }\n}\n\u003c/code\u003e\u003c/pre\u003e\n\u003cp\u003eTên file cần đặt theo đúng conventions của Amplify. Tuy nhiên để đơn giản thì bạn có thể copy lại file vtl đã có sẵn trong thư mục build của amplify và tùy biến lại.\u003c/p\u003e\n\u003cp\u003eKhi chạy lệnh \u003ccode\u003eamplify push\u003c/code\u003e, Amplify sẽ copy file trong thư mục này vào thư mục cùng tên trong thư mục build. Đồng thời khởi tạo lambda function với template được chỉ định.\u003c/p\u003e\n\u003cp\u003eNếu push thành công thì trong lambda function, ngoài các thông tin đã có, bạn sẽ nhận được thêm selectionSetList trong tham số event đầu vào.\u003c/p\u003e\n\u003cp\u003eKhi đó, event trong ví dụ ở đầu bài sẽ có dạng như sau:\u003c/p\u003e\n\u003cpre\u003e\u003ccode class=\"language-json\"\u003e{\n    \"typeName\": \"Query\",\n    \"fieldName\": \"organizationList\",\n    \"arguments\": {},\n    \"identity\": {\n        // Cognito user info\n    },\n    \"source\": null,\n    \"request\": {\n        \"headers\": {\n            // Request headers\n        }\n    },\n    \"prev\": {\n        \"result\": {}\n    },\n    \"selectionSetList\": [\n        \"organizations_list\",\n        \"organizations_list/name\",\n        \"organizations_list/organization_id\",\n        \"organizations_list/description\",\n        \"organizations_list/locations_list\",\n        \"organizations_list/locations_list/addr1\",\n        \"organizations_list/locations_list/description\",\n        \"organizations_list/locations_list/loc_name\",\n        \"organizations_list/locations_list/sysid\",\n        \"organizations_list/locations_list/loc_status\"\n    ]\n}\n\u003c/code\u003e\u003c/pre\u003e\n\u003cp\u003e\u003ccode\u003eselectionSetList\u003c/code\u003e ở đây chính là tham số mà lambda cần để sinh query. Đến đây lambda đã có đầy đủ thông tin, việc còn lại chỉ là sinh query để đáp ứng Graphql nữa thôi. :))\nChúc các bạn thành công!\u003c/p\u003e\n","title":"Nhận selectionSetList từ Appsync trong lambda","date":"2021-05-03"}},"__N_SSG":true},"page":"/posts/[id]","query":{"id":"nhan-selectionSetList-tu-appsync-trong-lambda"},"buildId":"IvJUEXviiEM49m9UPVfFO","isFallback":false,"gsp":true}</script><script nomodule="" src="/_next/static/chunks/polyfills-eef578260fd80f8fff94.js"></script><script src="/_next/static/chunks/webpack-189c53927ffd3caf09c3.js" async=""></script><script src="/_next/static/chunks/framework-c5113a73163ba9a6512c.js" async=""></script><script src="/_next/static/chunks/main-460b9f826c931ed60fcd.js" async=""></script><script src="/_next/static/chunks/pages/_app-705d7b8cc47a7dd319bb.js" async=""></script><script src="/_next/static/chunks/996-fa0b52be06882e958afa.js" async=""></script><script src="/_next/static/chunks/pages/posts/%5Bid%5D-27f42a375e0fc7d01fb3.js" async=""></script><script src="/_next/static/IvJUEXviiEM49m9UPVfFO/_buildManifest.js" async=""></script><script src="/_next/static/IvJUEXviiEM49m9UPVfFO/_ssgManifest.js" async=""></script></body></html>
